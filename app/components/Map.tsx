@@ -79,7 +79,7 @@ export default function MapComponent() {
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 10000); 
       
-      const res = await fetch(`https://overpass-api.de/api/interpreter?data=${encodeURIComponent(query)}`, { 
+      const res = await fetch(`/api/booths?lat=${lat}&lon=${lon}`, {
         signal: controller.signal,
         headers: {
             'Accept': 'application/json'
