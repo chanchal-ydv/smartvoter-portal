@@ -1,6 +1,7 @@
 "use client";
 import { useEffect, useState, useRef } from 'react';
 import { MapContainer, TileLayer, Marker, Popup, useMap, Circle } from 'react-leaflet';
+// @ts-ignore
 import 'leaflet/dist/leaflet.css';
 import L from 'leaflet';
 import { Search, Navigation, MapPin, Loader2, AlertCircle, X } from 'lucide-react';
@@ -26,7 +27,6 @@ function RecenterMap({ lat, lng }: { lat: number; lng: number }) {
 }
 
 export default function MapComponent() {
-  // CRITICAL FIX: We use a unique ID to force a fresh map instance if React tries to reuse it
   const [mapId, setMapId] = useState("map-init");
   const [isMounted, setIsMounted] = useState(false);
   
@@ -42,11 +42,10 @@ export default function MapComponent() {
 
   useEffect(() => {
     setIsMounted(true);
-    // This ensures we get a unique map ID only after the component is fully mounted in the browser
     setMapId(`map-${Date.now()}`);
   }, []);
 
-  // --- 3. DYNAMIC SIMULATOR ---
+  // --- 3. DYNAMIC SIMULATOR (Fallback) ---
   const generateRandomBooths = (centerLat: number, centerLng: number) => {
     const newBooths = [];
     const names = ["Govt. Primary School", "St. Xavier's College", "Community Centre Hall", "Municipal Corporation Office", "Public Library", "City High School"];
@@ -67,35 +66,61 @@ export default function MapComponent() {
     return newBooths;
   };
 
-  // --- 4. DATA FETCHER ---
+  // --- 4. DATA FETCHER (Relaxed Timeout & Polygon Support) ---
   const fetchNearbyBooths = async (lat: number, lon: number) => {
     setLoadingBooths(true);
     setUsingSimulation(false);
     setBooths([]); 
 
-    const query = `[out:json][timeout:4];(node["amenity"~"school|college|community_centre|townhall"](around:1000, ${lat}, ${lon}););out body 6;`;
+    // 10s timeout, targeting nodes and ways, using 'out center' for accurate building pins
+    const query = `[out:json][timeout:10];(node["amenity"~"school|college|community_centre"](around:3000,${lat},${lon});way["amenity"~"school|college|community_centre"](around:3000,${lat},${lon}););out center 12;`;
 
     try {
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 4000);
-      const res = await fetch(`https://overpass-api.de/api/interpreter?data=${encodeURIComponent(query)}`, { signal: controller.signal });
+      const timeoutId = setTimeout(() => controller.abort(), 10000); 
+      
+      const res = await fetch(`https://overpass-api.de/api/interpreter?data=${encodeURIComponent(query)}`, { 
+        signal: controller.signal,
+        headers: {
+            'Accept': 'application/json'
+        }
+      });
       clearTimeout(timeoutId);
+
+      if (!res.ok) {
+         throw new Error(`API responded with status: ${res.status}`);
+      }
+
       const data = await res.json();
       
       if (data.elements && data.elements.length > 0) {
-        const realBooths = data.elements.map((place: any, index: number) => ({
-          id: place.id,
-          lat: place.lat,
-          lng: place.lon,
-          name: place.tags.name || "Govt. Polling Station", 
-          type: "OFFICIAL BOOTH",
-          wait: index % 3 === 0 ? "High" : "Low"
-        }));
-        setBooths(realBooths);
+        const realBooths = data.elements.map((place: any, index: number) => {
+          // Extract coordinates whether it's a single point (node) or a large building (way center)
+          const itemLat = place.lat || (place.center && place.center.lat);
+          const itemLng = place.lon || (place.center && place.center.lon);
+          
+          if (!itemLat || !itemLng) return null;
+
+          return {
+            id: place.id,
+            lat: itemLat,
+            lng: itemLng,
+            name: place.tags?.name || "Govt. Polling Booth (Public Facility)", 
+            type: "OFFICIAL BOOTH",
+            wait: index % 3 === 0 ? "High" : index % 3 === 1 ? "Medium" : "Low"
+          };
+        }).filter(Boolean);
+
+        if (realBooths.length > 0) {
+          setBooths(realBooths);
+        } else {
+          throw new Error("Found places but no valid coordinates.");
+        }
       } else {
-        throw new Error("No real data found");
+        throw new Error("No real data found in this radius.");
       }
-    } catch (error) {
+    } catch (error: any) {
+      console.error("OVERPASS API ERROR:", error.message || error);
       setUsingSimulation(true);
       setBooths(generateRandomBooths(lat, lon));
     } finally {
@@ -134,7 +159,7 @@ export default function MapComponent() {
     const lon = parseFloat(suggestion.lon);
     
     setPosition([lat, lon]);
-    fetchNearbyBooths(lat, lon);
+    // The useEffect will automatically catch this position change and trigger the fetch
   };
 
   const handleManualSearch = async (e: React.FormEvent) => {
@@ -143,11 +168,12 @@ export default function MapComponent() {
     selectSuggestion(suggestions[0]); 
   };
 
+  // Trigger search on mount AND whenever position changes (via GPS or Search)
   useEffect(() => {
     if (isMounted) {
-      fetchNearbyBooths(28.6139, 77.2090);
+      fetchNearbyBooths(position[0], position[1]);
     }
-  }, [isMounted]);
+  }, [isMounted, position]);
 
   if (!isMounted) {
     return (
@@ -204,8 +230,11 @@ export default function MapComponent() {
           navigator.geolocation.getCurrentPosition((pos) => {
              const { latitude, longitude } = pos.coords;
              setPosition([latitude, longitude]);
-             fetchNearbyBooths(latitude, longitude);
-          });
+          }, (err) => {
+             console.error("Geolocation failed, executing search for current center position fallback.", err);
+             // Manually trigger if GPS fails, otherwise useEffect handles it
+             fetchNearbyBooths(position[0], position[1]);
+          }, { enableHighAccuracy: true });
         }}
         title="Find My Location"
       >
@@ -228,7 +257,6 @@ export default function MapComponent() {
         </div>
       )}
 
-      {/* CRITICAL FIX: The key={mapId} forces React to destroy and recreate the map if it crashes */}
       <MapContainer 
         key={mapId}
         center={position} 
